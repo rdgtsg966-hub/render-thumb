@@ -1,61 +1,116 @@
 import express from "express";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
 import fetch from "node-fetch";
 import fs from "fs";
-
-ffmpeg.setFfmpegPath(ffmpegPath);
+import path from "path";
+import cors from "cors";
+import { exec } from "child_process";
 
 const app = express();
+app.use(cors());
+
+const TEMP_DIR = "/tmp/videx";
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
 
 app.get("/", (req, res) => {
-  res.send("Thumbnail API is running");
+    res.send("Videx Thumbnail API OK");
 });
+
+/*
+====================================================
+   GERADOR DE THUMBNAIL COMPATÍVEL COM RENDER
+====================================================
+*/
 
 app.get("/thumb", async (req, res) => {
-  const videoUrl = req.query.video;
+    const videoUrl = req.query.video;
 
-  if (!videoUrl) {
-    return res.status(400).send("Missing ?video=");
-  }
+    if (!videoUrl) {
+        return res.status(400).send("Missing video url.");
+    }
 
-  try {
-    // baixa o vídeo temporário
-    const tempFile = "temp_" + Date.now() + ".mp4";
-    const tempThumb = "thumb_" + Date.now() + ".jpg";
+    console.log("📥 Recebendo thumbnail de:", videoUrl);
 
-    const response = await fetch(videoUrl);
-    const buffer = await response.arrayBuffer();
-    fs.writeFileSync(tempFile, Buffer.from(buffer));
+    try {
+        // nome temporário
+        const tempVideo = path.join(TEMP_DIR, "input_" + Date.now() + ".mp4");
+        const tempThumb = path.join(TEMP_DIR, "thumb_" + Date.now() + ".jpg");
 
-    // extrai thumbnail real (0.1s)
-    await new Promise((resolve, reject) => {
-      ffmpeg(tempFile)
-        .on("error", reject)
-        .on("end", resolve)
-        .screenshots({
-          timestamps: ["0.1"],
-          filename: tempThumb,
-          folder: ".",
-          size: "480x?"
+        // ============================
+        // 1) BAIXAR VÍDEO COM HEADERS
+        // ============================
+        console.log("⬇ Baixando vídeo...");
+
+        const response = await fetch(videoUrl, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://videx.space"
+            }
         });
-    });
 
-    const img = fs.readFileSync(tempThumb);
+        if (!response.ok) {
+            console.log("❌ Erro HTTP:", response.status);
+            return res.status(500).send("Erro gerando thumbnail (download).");
+        }
 
-    res.setHeader("Content-Type", "image/jpeg");
-    res.send(img);
+        const arrayBuf = await response.arrayBuffer();
+        fs.writeFileSync(tempVideo, Buffer.from(arrayBuf));
 
-    // limpa
-    fs.unlinkSync(tempFile);
-    fs.unlinkSync(tempThumb);
+        if (!fs.existsSync(tempVideo) || fs.statSync(tempVideo).size < 5000) {
+            console.log("❌ Arquivo baixado muito pequeno, bloqueado pelo host.");
+            return res.status(500).send("Erro gerando thumbnail (arquivo vazio).");
+        }
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Erro gerando thumbnail");
-  }
+        // ============================
+        // 2) RODAR FFMPEG NO RENDER
+        // ============================
+        console.log("🎞 Executando FFmpeg...");
+
+        const cmd = `ffmpeg -y -i "${tempVideo}" -ss 00:00:01 -vframes 1 -vf "scale=400:-1" "${tempThumb}"`;
+
+        exec(cmd, (err, stdout, stderr) => {
+            if (err) {
+                console.log("❌ FFmpeg error:", stderr);
+                return res.status(500).send("Erro gerando thumbnail (ffmpeg).");
+            }
+
+            if (!fs.existsSync(tempThumb)) {
+                console.log("❌ FFmpeg não gerou thumb.");
+                return res.status(500).send("Erro gerando thumbnail.");
+            }
+
+            // ============================
+            // 3) ENVIAR THUMB
+            // ============================
+            console.log("✅ Thumbnail gerado com sucesso!");
+
+            res.setHeader("Content-Type", "image/jpeg");
+            fs.createReadStream(tempThumb).pipe(res);
+
+            // limpar após enviar
+            setTimeout(() => {
+                try {
+                    fs.unlinkSync(tempVideo);
+                    fs.unlinkSync(tempThumb);
+                } catch {}
+            }, 5000);
+        });
+
+    } catch (err) {
+        console.log("❌ Erro geral:", err);
+        return res.status(500).send("Erro gerando thumbnail.");
+    }
 });
 
-app.listen(3000, () => {
-  console.log("Server started on port 3000");
+/*
+============================================
+   SERVIDOR RODANDO NO PORT PADRÃO DO RENDER
+============================================
+*/
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log("🚀 Videx Thumbnail API rodando na porta " + PORT);
 });
